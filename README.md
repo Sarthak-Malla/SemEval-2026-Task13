@@ -134,6 +134,10 @@ We aim to align all key dates with the official SemEval committee schedule and w
 
 Be creative! The only restriction is that we **do not allow** the usage of AI-generated content detectors, trained by third parties and restrict the data usage to the provided training sets. Other than that, feel free to use any methods and technologies you prefer.
 
+>**Q5: How do I start?**
+
+You can use [Starter Files](https://github.com/mbzuai-nlp/SemEval-2026-Task13/tree/main/baselines/Kaggle_starters) to have some direction of work. You may experiment with backbone models, training strategy etc. Also feel free to ask questions and share your ideas on **Discussion** page of Kaggle competitions.
+
 ## Important Dates
 - ~~Sample data ready: 15 July 2025~~
 - ~~Training data ready: **1 September 2025**~~
