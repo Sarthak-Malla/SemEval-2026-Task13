@@ -1,10 +1,11 @@
 # mine
 /*_results
 /wandb
-/train_logs
+/*_logs
 /*.txt
 /*.csv
 /*checkpoints
+task_B/test.parquet
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

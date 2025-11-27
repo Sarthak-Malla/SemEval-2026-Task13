@@ -33,14 +33,6 @@ except ImportError:
     WANDB_AVAILABLE = False
     print("Warning: wandb not installed. Install with: pip install wandb")
 
-# print the GPU available
-print("CUDA available:", torch.cuda.is_available())
-print("GPU count:", torch.cuda.device_count())
-
-for i in range(torch.cuda.device_count()):
-    print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-    print(torch.cuda.get_device_properties(i))
-
 # configs for the trainer setup
 @dataclass
 class TrainingConfig:
@@ -59,22 +51,17 @@ class TrainingConfig:
     max_length: int = 256
     batch_size: int = 32
     gradient_accumulation_steps: int = 2
-    epochs: int = 5
+    epochs: int = 10
     lr: float = 5e-5
     weight_decay: float = 0.01
-    warmup_ratio: float = 0.2
+    warmup_ratio: float = 0.1
     
-    # optimization strategies:
-    # pooling strategy
+    # NEW: Pooling strategy
     pooling_strategy: str = "mean"
-
-    # focal loss function
-    use_focal_loss: bool = False
-    focal_loss_gamma: float = 2.0
 
     num_labels: int = 11
     max_samples_per_class: int = 20_000 
-    use_class_weights: bool = False
+    use_class_weights: bool = True
 
     eval_steps: int = 200
     save_steps: int = 200
@@ -85,7 +72,7 @@ class TrainingConfig:
     seed: int = 42
     fp16: bool = True
     num_workers: int = 4
-    num_procs: int = 16
+    num_procs: int = 8
 
 def set_seed(seed: int):
     import random
@@ -112,47 +99,19 @@ class AttentionPooling(nn.Module):
         # hidden: (batch, seq_len, hidden_dim)
         # mask: (batch, seq_len)
         
-        # compute attention scores
+        # Compute attention scores
         attn_scores = self.attention(hidden).squeeze(-1)  # (batch, seq_len)
         
-        # mask out padding positions
+        # Mask out padding positions
         attn_scores = attn_scores.masked_fill(~mask.bool(), float('-inf'))
         
-        # softmax to get attention weights
+        # Softmax to get attention weights
         attn_weights = F.softmax(attn_scores, dim=1)  # (batch, seq_len)
         
-        # weighted sum
+        # Weighted sum
         pooled = torch.bmm(attn_weights.unsqueeze(1), hidden).squeeze(1)  # (batch, hidden_dim)
         
         return pooled
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
-        """
-        Args:
-            alpha (Tensor, optional): Weights for each class.
-            gamma (float): Focusing parameter.
-            reduction (str): 'mean', 'sum' or 'none'.
-        """
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        # inputs: (N, C) - logits
-        # targets: (N) - class labels
-        
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
 
 class CodeT5Config(PretrainedConfig):
     model_type = "codet5_classifier"
@@ -162,8 +121,6 @@ class CodeT5Config(PretrainedConfig):
         model_name: str = "Salesforce/codet5p-220m",
         num_labels: int = 11,
         pooling_strategy: str = "mean",
-        use_focal_loss: bool = False,
-        focal_loss_gamma: float = 2.0,
         class_weights: Optional[torch.Tensor] = None,
         **kwargs
     ):
@@ -171,8 +128,6 @@ class CodeT5Config(PretrainedConfig):
         self.model_name = model_name
         self.num_labels = num_labels
         self.pooling_strategy = pooling_strategy
-        self.use_focal_loss = use_focal_loss
-        self.focal_loss_gamma = focal_loss_gamma
         # Convert tensor to list for JSON serialization
         if class_weights is not None and isinstance(class_weights, torch.Tensor):
             self.class_weights = class_weights.tolist()
@@ -187,7 +142,7 @@ class CodeT5Classifier(PreTrainedModel):
         self.encoder = T5EncoderModel.from_pretrained(config.model_name)
         dim = self.encoder.config.d_model
         
-        # initialize pooling layer
+        # Initialize pooling layer
         self.pooling_strategy = config.pooling_strategy
         if self.pooling_strategy == "attention":
             self.attention_pool = AttentionPooling(dim)
@@ -201,9 +156,8 @@ class CodeT5Classifier(PreTrainedModel):
         )
 
         # register class weights as buffer if provided
-        weights_tensor = None
         if config.class_weights is not None:
-            # convert list back to tensor if needed
+            # Convert list back to tensor if needed
             if isinstance(config.class_weights, list):
                 weights_tensor = torch.FloatTensor(config.class_weights)
             else:
@@ -211,13 +165,6 @@ class CodeT5Classifier(PreTrainedModel):
             self.register_buffer('class_weights', weights_tensor)
         else:
             self.class_weights = None
-        
-        self.loss_fct = None
-        if config.use_focal_loss:
-            self.loss_fct = FocalLoss(
-                alpha=weights_tensor, # passing class weights as alpha
-                gamma=config.focal_loss_gamma
-            )
 
     def pool_hidden_states(self, hidden, mask):
         """Apply the configured pooling strategy"""
@@ -242,30 +189,20 @@ class CodeT5Classifier(PreTrainedModel):
             attention_mask=attention_mask,
         )
         
-        # apply pooling strategy
+        # Apply pooling strategy
         pooled = self.pool_hidden_states(outputs.last_hidden_state, attention_mask)
         logits = self.classifier(pooled)
 
         loss = None
         if labels is not None:
-            # switch between Focal Loss and Cross Entropy
-            if self.config.use_focal_loss:
-                # The FocalLoss class handles device placement automatically 
-                # but we ensure weights are on the right device if not using buffer
-                if self.loss_fct.alpha is not None and self.loss_fct.alpha.device != logits.device:
-                     self.loss_fct.alpha = self.loss_fct.alpha.to(logits.device)
-                
-                loss = self.loss_fct(logits, labels)
+            if self.class_weights is not None:
+                loss = F.cross_entropy(
+                    logits, 
+                    labels, 
+                    weight=self.class_weights.to(logits.device)
+                )
             else:
-                # standard Cross Entropy
-                if self.class_weights is not None:
-                    loss = F.cross_entropy(
-                        logits, 
-                        labels, 
-                        weight=self.class_weights.to(logits.device)
-                    )
-                else:
-                    loss = F.cross_entropy(logits, labels)
+                loss = F.cross_entropy(logits, labels)
 
         if not return_dict:
             output = (logits,)
@@ -290,7 +227,7 @@ class CodeOriginTrainer:
             wandb.init(
                 project=cfg.wandb_project,
                 entity=cfg.wandb_entity,
-                name=cfg.wandb_run_name or f"codet5-task{cfg.task_subset}-attention-focal",
+                name=cfg.wandb_run_name or f"codet5-task{cfg.task_subset}-{cfg.pooling_strategy}",
                 config=asdict(cfg),
                 reinit=True,
             )
@@ -430,8 +367,6 @@ class CodeOriginTrainer:
             num_labels=self.cfg.num_labels,
             pooling_strategy=self.cfg.pooling_strategy,
             class_weights=class_weights,
-            use_focal_loss=self.cfg.use_focal_loss,
-            focal_loss_gamma=self.cfg.focal_loss_gamma
         )
         
         self.model = CodeT5Classifier(model_config)
@@ -606,7 +541,7 @@ def parse_args():
                    help='Output directory')
 
     # train params
-    p.add_argument("--epochs", type=int, default=5, 
+    p.add_argument("--epochs", type=int, default=10, 
                    help='Number of training epochs')
     p.add_argument("--batch_size", type=int, default=32, 
                    help='Batch size per device')
@@ -617,15 +552,9 @@ def parse_args():
     p.add_argument("--max_length", type=int, default=256, 
                    help='Maximum sequence length')
     
-    # pooling strategy argument
+    # NEW: Pooling strategy argument
     p.add_argument("--pooling", choices=['mean', 'attention'], default='mean',
                    help='Pooling strategy: mean or attention')
-
-    # focal loss args
-    p.add_argument("--use_focal_loss", action='store_true',
-                   help='Enable Focal Loss instead of Cross Entropy')
-    p.add_argument("--focal_loss_gamma", type=float, default=2.0,
-                   help='Gamma parameter for Focal Loss (focusing factor)')
     
     p.add_argument("--max_samples_per_class", type=int, default=20_000,
                    help='Maximum samples per class for balancing')
@@ -664,13 +593,9 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         lr=args.lr,
-
         max_length=args.max_length,
         pooling_strategy=args.pooling,
-        use_focal_loss=args.use_focal_loss,
-        focal_loss_gamma=args.focal_loss_gamma,
         max_samples_per_class=args.max_samples_per_class,
-
         use_class_weights=not args.no_class_weights,
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
