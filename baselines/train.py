@@ -21,13 +21,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class CodeBERTTrainer:
-    def __init__(self, task_subset='A', max_length=512, model_name="microsoft/codebert-base"):
+    def __init__(self, task_subset='A', max_length=512, model_name="microsoft/codebert-base", num_procs=8):
         self.task_subset = task_subset
         self.max_length = max_length
         self.model_name = model_name
         self.tokenizer = None
         self.model = None
         self.num_labels = None
+        self.num_procs = num_procs
         
     def load_and_prepare_data(self):
         logger.info(f"Loading dataset subset {self.task_subset}...")
@@ -98,12 +99,14 @@ class CodeBERTTrainer:
         train_dataset = train_dataset.map(
             self.tokenize_function,
             batched=True,
-            remove_columns=['code']
+            remove_columns=['code'],
+            num_proc=self.num_procs
         )
         val_dataset = val_dataset.map(
             self.tokenize_function,
             batched=True,
-            remove_columns=['code']
+            remove_columns=['code'],
+            num_proc=self.num_procs
         )
         
         train_dataset = train_dataset.rename_column('label', 'labels')
@@ -137,7 +140,7 @@ class CodeBERTTrainer:
             weight_decay=0.01,
             logging_dir='./logs',
             logging_steps=100,
-            evaluation_strategy="steps",
+            eval_strategy="steps",
             eval_steps=500,
             save_strategy="steps",
             save_steps=500,

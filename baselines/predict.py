@@ -23,7 +23,7 @@ def load_model_and_tokenizer(model_path, device):
 
 def collate_fn(batch, tokenizer, max_length):
     codes = [item["code"] for item in batch]
-    ids = [item["ID"] for item in batch]
+    ids = [item["label"] for item in batch]
     encodings = tokenizer(
         codes,
         truncation=True,
@@ -48,8 +48,8 @@ def predict(model_path, parquet_path, output_path, max_length=512, batch_size=16
 
     # Validate schema
     first_row = next(iter(dataset))
-    if not {"ID", "code"}.issubset(first_row.keys()):
-        raise ValueError("Parquet file must contain 'ID' and 'code' columns")
+    if not {"label", "code"}.issubset(first_row.keys()):
+        raise ValueError("Parquet file must contain 'label' and 'code' columns")
 
     # DataLoader for streaming batches
     dataloader = DataLoader(
@@ -60,7 +60,7 @@ def predict(model_path, parquet_path, output_path, max_length=512, batch_size=16
 
     # Open CSV and write incrementally
     with open(output_path, "w") as f:
-        f.write("ID,prediction\n")
+        f.write("ID,label\n")
 
         for batch in tqdm(dataloader, desc="Predicting"):
             input_ids = batch["input_ids"].to(device)
@@ -79,7 +79,7 @@ def predict(model_path, parquet_path, output_path, max_length=512, batch_size=16
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run inference with trained CodeBERT model (streaming)")
     parser.add_argument("--model_path", type=str, required=True, help="Path to trained model folder")
-    parser.add_argument("--parquet_path", type=str, required=True, help="Path to input parquet file with ID and code")
+    parser.add_argument("--parquet_path", type=str, required=True, help="Path to input parquet file with label and code")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save predictions CSV")
     parser.add_argument("--max_length", type=int, default=512, help="Maximum sequence length")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for inference")
