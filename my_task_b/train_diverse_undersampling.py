@@ -25,21 +25,31 @@ from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 import pandas as pd
+from sentence_transformers import SentenceTransformer
+import logging
+from tqdm import tqdm
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
 
 try:
     import wandb
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
-    print("Warning: wandb not installed. Install with: pip install wandb")
+    logger.warn("Warning: wandb not installed. Install with: pip install wandb")
 
-# print the GPU available
-print("CUDA available:", torch.cuda.is_available())
-print("GPU count:", torch.cuda.device_count())
+# logger.info the GPU available
+logger.info(f"CUDA available: {torch.cuda.is_available()}")
+logger.info(f"GPU count: {torch.cuda.device_count()}")
 
 for i in range(torch.cuda.device_count()):
-    print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-    print(torch.cuda.get_device_properties(i))
+    logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+    logger.info(torch.cuda.get_device_properties(i))
 
 # configs for the trainer setup
 @dataclass
@@ -58,6 +68,7 @@ class TrainingConfig:
     # settings to play around with
     max_length: int = 256
     batch_size: int = 32
+    embed_batch_size: int = 128 # this is used for the undersampling (embedding)
     gradient_accumulation_steps: int = 2
     epochs: int = 5
     lr: float = 5e-5
@@ -278,12 +289,18 @@ class CodeT5Classifier(PreTrainedModel):
             attentions=None,
         )
 
-
 class CodeOriginTrainer:
     def __init__(self, cfg: TrainingConfig):
         self.cfg = cfg
         set_seed(cfg.seed)
         os.makedirs(cfg.output_dir, exist_ok=True)
+
+        # this is a duplicate for the data preprocess to work
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
+
+        global GLOBAL_TOKENIZER, GLOBAL_MAX_LENGTH
+        GLOBAL_TOKENIZER = tokenizer
+        GLOBAL_MAX_LENGTH = cfg.max_length
 
         # initialize WandB
         if cfg.use_wandb and WANDB_AVAILABLE:
@@ -294,93 +311,205 @@ class CodeOriginTrainer:
                 config=asdict(cfg),
                 reinit=True,
             )
-            print("WandB initialized successfully")
+            logger.info("WandB initialized successfully")
         elif cfg.use_wandb and not WANDB_AVAILABLE:
-            print("Warning: WandB requested but not available. Install with: pip install wandb")
+            logger.warn("Warning: WandB requested but not available. Install with: pip install wandb")
             cfg.use_wandb = False
-
+        
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # initialize a basic version of the model early to use for embedding extraction
+        # this will be re-initialized properly in initialize_model() later
+        temp_config = CodeT5Config(model_name=self.cfg.model_name, pooling_strategy=self.cfg.pooling_strategy)
+        self.model = CodeT5Classifier(temp_config)
+        self.model.to(self.device)
+
         self.trainer = None
         self.train_labels = None
+    
+    def _select_diverse_indices(self, embeddings: np.ndarray, n: int) -> np.ndarray:
+        """Greedy max-min (farthest-point) sampling over cosine distance."""
+        N = embeddings.shape[0]
+        if n >= N:
+            return np.arange(N)
+
+        emb = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12)
+
+        rng = np.random.default_rng(self.cfg.seed)
+        # start from a random point
+        first_idx = int(rng.integers(0, N))
+        selected = [first_idx]
+
+        # min_dist[i] = min distance from point i to any selected point
+        sims = emb @ emb[first_idx]          # (N,)
+        min_dist = 1.0 - sims                # cosine distance
+
+        min_dist[first_idx] = -1.0
+        for _ in range(1, n):
+            # pick the point that is farthest from the current selected set
+            next_idx = int(np.argmax(min_dist))
+            selected.append(next_idx)
+
+            sims = emb @ emb[next_idx]       # cosine sim to new point
+            dist = 1.0 - sims
+            min_dist = np.minimum(min_dist, dist)
+
+            min_dist[next_idx] = -1.0
+
+        return np.array(selected, dtype=int)
+    
+    def _compute_embeddings(self, codes: list, batch_size: int = 32) -> np.ndarray:
+        """Generates pooled embeddings using the CodeT5Classifier's encoder."""
+        self.model.eval() # set model to evaluation mode
+        all_embeddings = []
+        
+        logger.info(f"Computing embeddings for {len(codes)} samples using {self.cfg.model_name}...")
+        
+        with torch.no_grad():
+            for i in tqdm(range(0, len(codes), batch_size), desc="Embedding"):
+                batch_codes = codes[i : i + batch_size]
+                
+                inputs = self.tokenizer(
+                    batch_codes,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.cfg.max_length
+                )
+                
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                outputs = self.model.encoder(
+                    input_ids=inputs['input_ids'],
+                    attention_mask=inputs['attention_mask']
+                )
+                
+                pooled_output = self.model.pool_hidden_states(
+                    outputs.last_hidden_state, 
+                    inputs['attention_mask']
+                )
+                
+                all_embeddings.append(pooled_output.cpu().numpy())
+
+                if i == 2:
+                    breakpoint()
+
+        torch.cuda.empty_cache()
+        
+        return np.concatenate(all_embeddings, axis=0)
 
     def load_data(self):
-        """Load and balance dataset"""
-        print(f"Loading dataset subset {self.cfg.task_subset}...")
+        """Load dataset, split first, then balance ONLY the training split."""
+        logger.info(f"Loading dataset subset {self.cfg.task_subset}...")
         
         try:
             dataset = load_dataset("DaniilOr/SemEval-2026-Task13", self.cfg.task_subset)
             train_data = dataset['train']
-            print(f"Loaded {len(train_data)} training samples")
-            
+            logger.info(f"Loaded {len(train_data)} training samples")
+
             df = train_data.to_pandas()
-            
-            print(f"Dataset columns: {df.columns.tolist()}")
-            
+            logger.info(f"Dataset columns: {df.columns.tolist()}")
+
             if 'code' not in df.columns or 'label' not in df.columns:
                 raise ValueError("Dataset must contain 'code' and 'label' columns")
-            
+
             df = df.dropna(subset=['code', 'label'])
             df['label'] = df['label'].astype(int)
-            
-            print(f"\nOriginal label distribution:")
-            print(df['label'].value_counts().sort_index())
-            
-            # balance the dataset by undersampling majority classes
-            max_samples = self.cfg.max_samples_per_class
-            df_balanced = df.groupby('label', group_keys=False).apply(
-                lambda x: x.sample(n=min(len(x), max_samples), random_state=self.cfg.seed)
-            ).reset_index(drop=True)
-            
-            print(f"\nBalanced dataset from {len(df)} to {len(df_balanced)} samples")
-            print(f"New label distribution:")
-            print(df_balanced['label'].value_counts().sort_index())
-            
-            self.cfg.num_labels = df_balanced['label'].nunique()
-            
-            # Stratified train-val split
+
+            logger.info("\nOriginal label distribution (full data):")
+            logger.info(df['label'].value_counts().sort_index())
+
+            # split the data before balancing
             train_df, val_df = train_test_split(
-                df_balanced,
+                df,
                 test_size=0.2,
-                stratify=df_balanced['label'],
-                random_state=self.cfg.seed
+                stratify=df['label'],
+                random_state=self.cfg.seed,
             )
-            
-            print(f"\nTrain samples: {len(train_df)}, Val samples: {len(val_df)}")
-            print(f"Train label distribution:")
-            print(train_df['label'].value_counts().sort_index())
-            
-            # store labels for class weight calculation
-            self.train_labels = train_df['label'].values
-            
-            # convert to HuggingFace datasets
-            train = Dataset.from_pandas(train_df[['code', 'label']], preserve_index=False)
-            val = Dataset.from_pandas(val_df[['code', 'label']], preserve_index=False)
-            
-            # log to WandB
+
+            logger.info(f"\nSplit sizes -> Train: {len(train_df)}, Val: {len(val_df)}")
+            logger.info("Train label distribution (before balancing):")
+            logger.info(train_df['label'].value_counts().sort_index())
+            logger.info("Val label distribution (kept original):")
+            logger.info(val_df['label'].value_counts().sort_index())
+
+            # we only balance the training data
+            label_counts = train_df['label'].value_counts()
+            target_n = label_counts.min()  # smallest class size in TRAIN only
+            logger.info(f"\nSmallest TRAIN class size: {target_n} (target per-class sample size)")
+            logger.info(f"\nWe will use: {target_n} x 11 (target per-class sample size)")
+            target_n *= 11
+
+            balanced_parts = []
+
+            for label, df_label in train_df.groupby('label'):
+                n_samples = len(df_label)
+                logger.info(f"\nProcessing label {label} in TRAIN: {n_samples} samples")
+
+                if n_samples <= target_n:
+                    logger.info(f"  Using all {n_samples} samples (no undersampling needed).")
+                    balanced_parts.append(df_label)
+                    continue
+
+                codes = df_label['code'].tolist()
+                logger.info(f"  Computing embeddings for {len(codes)} samples...")
+                embeddings = self._compute_embeddings(
+                    codes,
+                    batch_size=getattr(self.cfg, "embed_batch_size", 128),
+                )
+
+                logger.info(f"  Selecting {target_n} diverse samples...")
+                idxs = self._select_diverse_indices(embeddings, target_n)
+                df_selected = df_label.iloc[idxs].reset_index(drop=True)
+                balanced_parts.append(df_selected)
+
+            train_balanced_df = pd.concat(balanced_parts, axis=0).reset_index(drop=True)
+
+            logger.info(
+                f"\nBalanced TRAIN dataset from {len(train_df)} to {len(train_balanced_df)} samples"
+            )
+            logger.info("New TRAIN label distribution:")
+            logger.info(train_balanced_df['label'].value_counts().sort_index())
+
+            # store labels for class weight calculation (use BALANCED train)
+            self.train_labels = train_balanced_df['label'].values
+
+            train = Dataset.from_pandas(
+                train_balanced_df[['code', 'label']],
+                preserve_index=False,
+            )
+            val = Dataset.from_pandas(
+                val_df[['code', 'label']],
+                preserve_index=False,
+            )
+
+            self.cfg.num_labels = train_balanced_df['label'].nunique()
+
             if self.cfg.use_wandb and WANDB_AVAILABLE:
                 wandb.config.update({
                     "original_samples": len(df),
-                    "balanced_samples": len(df_balanced),
-                    "train_samples": len(train_df),
+                    "train_original": len(train_df),
+                    "train_balanced": len(train_balanced_df),
                     "val_samples": len(val_df),
+                    "target_per_class_train": int(target_n),
                 })
-            
+
             return train, val
-            
+
         except Exception as e:
-            print(f"Error loading dataset: {e}")
+            logger.info(f"Error loading dataset: {e}")
             raise
 
     def preprocess_datasets(self, train, val):
         """Tokenize and prepare datasets"""
-        print("Tokenizing datasets...")
+        logger.info("Tokenizing datasets...")
         
         def tokenize_function(examples):
-            return self.tokenizer(
+            return GLOBAL_TOKENIZER(
                 examples['code'],
                 truncation=True,
-                max_length=self.cfg.max_length,
+                # max_length=self.cfg.max_length,
+                max_length=GLOBAL_MAX_LENGTH,
             )
         
         train = train.map(
@@ -401,23 +530,23 @@ class CodeOriginTrainer:
         train = train.rename_column('label', 'labels')
         val = val.rename_column('label', 'labels')
         
-        print("Tokenization complete")
+        logger.info("Tokenization complete")
         return train, val
 
     def initialize_model(self):
         """Initialize model with optional class weights"""
-        print(f"Initializing model with {self.cfg.pooling_strategy} pooling...")
+        logger.info(f"Initializing model with {self.cfg.pooling_strategy} pooling...")
         
         class_weights = None
         if self.cfg.use_class_weights and self.train_labels is not None:
-            print("Computing class weights...")
+            logger.info("Computing class weights...")
             weights = compute_class_weight(
                 'balanced',
                 classes=np.arange(self.cfg.num_labels),
                 y=self.train_labels
             )
             class_weights = torch.FloatTensor(weights)
-            print(f"Class weights: {class_weights.numpy()}")
+            logger.info(f"Class weights: {class_weights.numpy()}")
             
             if self.cfg.use_wandb and WANDB_AVAILABLE:
                 wandb.log({
@@ -434,8 +563,10 @@ class CodeOriginTrainer:
             focal_loss_gamma=self.cfg.focal_loss_gamma
         )
         
+        # re-initialize the model to ensure it has the final correct config
         self.model = CodeT5Classifier(model_config)
-        print(f"Model initialized with {self.cfg.num_labels} labels")
+        self.model.to(self.device)
+        logger.info(f"Model initialized with {self.cfg.num_labels} labels")
 
     def compute_metrics(self, eval_pred):
         """Compute evaluation metrics"""
@@ -469,7 +600,7 @@ class CodeOriginTrainer:
 
     def train(self, train_dataset, val_dataset):
         """Train the model using HuggingFace Trainer"""
-        print("Starting training...")
+        logger.info("Starting training...")
         
         report_to = []
         if self.cfg.use_wandb and WANDB_AVAILABLE:
@@ -531,13 +662,13 @@ class CodeOriginTrainer:
         with open(os.path.join(self.cfg.output_dir, "training_config.json"), "w") as f:
             json.dump(asdict(self.cfg), f, indent=2)
         
-        print(f"Training completed. Model saved to {self.cfg.output_dir}")
+        logger.info(f"Training completed. Model saved to {self.cfg.output_dir}")
         
         return self.trainer
 
     def evaluate_model(self, val_dataset):
         """Evaluate model and save metrics"""
-        print("Evaluating model...")
+        logger.info("Evaluating model...")
         
         predictions = self.trainer.predict(val_dataset)
         
@@ -559,11 +690,11 @@ class CodeOriginTrainer:
         with open(os.path.join(self.cfg.output_dir, "metrics.json"), "w") as f:
             json.dump(metrics, f, indent=2)
         
-        print(f"\nFinal Results:")
-        print(f"Macro F1: {metrics['macro_f1']:.4f}")
-        print(f"Accuracy: {metrics['accuracy']:.4f}")
-        print(f"Macro Precision: {metrics['macro_precision']:.4f}")
-        print(f"Macro Recall: {metrics['macro_recall']:.4f}")
+        logger.info(f"\nFinal Results:")
+        logger.info(f"Macro F1: {metrics['macro_f1']:.4f}")
+        logger.info(f"Accuracy: {metrics['accuracy']:.4f}")
+        logger.info(f"Macro Precision: {metrics['macro_precision']:.4f}")
+        logger.info(f"Macro Recall: {metrics['macro_recall']:.4f}")
         
         if self.cfg.use_wandb and WANDB_AVAILABLE:
             wandb.log({
@@ -587,11 +718,11 @@ class CodeOriginTrainer:
             if self.cfg.use_wandb and WANDB_AVAILABLE:
                 wandb.finish()
             
-            print("\nPipeline completed successfully!")
+            logger.info("\nPipeline completed successfully!")
             return self.trainer
             
         except Exception as e:
-            print(f"Error in pipeline: {e}")
+            logger.info(f"Error in pipeline: {e}")
             if self.cfg.use_wandb and WANDB_AVAILABLE:
                 wandb.finish(exit_code=1)
             raise
@@ -682,12 +813,12 @@ if __name__ == "__main__":
         seed=args.seed,
     )
 
-    print("="*60)
-    print("Training Configuration:")
-    print("="*60)
+    logger.info("="*60)
+    logger.info("Training Configuration:")
+    logger.info("="*60)
     for key, value in asdict(cfg).items():
-        print(f"{key:30s}: {value}")
-    print("="*60)
+        logger.info(f"{key:30s}: {value}")
+    logger.info("="*60)
 
     trainer = CodeOriginTrainer(cfg)
     trainer.run_full_pipeline()

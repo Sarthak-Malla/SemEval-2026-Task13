@@ -614,11 +614,11 @@ def parse_args():
                    help='Gradient accumulation steps')
     p.add_argument("--lr", type=float, default=5e-5, 
                    help='Learning rate')
-    p.add_argument("--max_length", type=int, default=256, 
+    p.add_argument("--max_length", type=int, default=512, 
                    help='Maximum sequence length')
     
     # pooling strategy argument
-    p.add_argument("--pooling", choices=['mean', 'attention'], default='mean',
+    p.add_argument("--pooling", choices=['mean', 'attention'], default='attention',
                    help='Pooling strategy: mean or attention')
 
     # focal loss args

@@ -9,8 +9,8 @@ source /apps/local/anaconda3/conda_init.sh
 conda activate semeval
 
 python -m my_task_b.predict \
-	--model_path "codet5_focal_20k_checkpoints" \
+	--model_path "codet5_balance_trainset_checkpoints" \
 	--parquet_path "task_B/test.parquet" \
-	--output_path "codet5_attention_pooling_focal_20k.csv" \
+	--output_path "codet5_balance_trainset.csv" \
 	--batch_size 32 \
 	--max_length 512
