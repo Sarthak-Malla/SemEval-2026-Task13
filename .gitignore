@@ -2,7 +2,7 @@
 /*_results
 /wandb
 /*_logs
-/*.txt
+/*results.txt
 /*.csv
 /*checkpoints
 task_B/test.parquet
